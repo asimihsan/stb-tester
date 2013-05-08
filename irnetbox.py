@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
 """Python module to control the RedRat irNetBox infrared emitter.
@@ -38,6 +39,7 @@ signal defined in the config file):
 
 """
 
+import argparse
 import binascii
 import errno
 import random
@@ -46,6 +48,11 @@ import socket
 import struct
 import sys
 import time
+
+from twisted.internet import defer
+from twisted.internet import protocol
+from twisted.internet import reactor
+from twisted.python import log
 
 
 class IRNetBox:
@@ -165,7 +172,7 @@ class IRNetBox:
     def _send(self, message_type, message_data=""):
         self._socket.sendall(_message(message_type, message_data))
         response_type, response_data = self._responses.next()
-        if response_type == MessageTypes.ERROR:
+        if response_type == MessageTypes.ERROR: 
             raise Exception("IRNetBox returned ERROR")
         if response_type == MessageTypes.DEVICE_VERSION:
             self.irnetbox_model, = struct.unpack(
@@ -331,3 +338,182 @@ class _FileToSocket:
 
     def recv(self, bufsize, flags=0):  # pylint: disable=W0613
         return self.file.read(bufsize)
+
+# IRNetBoxProxy and main functions
+#===========================================================================
+
+# -----------------------------------------------------------------------------
+#   !!AI The irnetbox locks up if you call it too fast too often. I've found that
+#   an inter-call sleep is required.
+# -----------------------------------------------------------------------------
+IRNETBOX_CALL_INTERVAL = 0.05
+# -----------------------------------------------------------------------------
+
+def string_to_hex(input_string):
+    return ':'.join(x.encode('hex') for x in input_string)
+
+
+class IRNetBoxProxyIRNetBoxSideProtocol(protocol.Protocol):
+    
+    def __init__(self):
+        self.current_data_received = ""
+
+    def connectionMade(self):
+        log.msg("IRNetBoxProxyIRNetBoxSideProtocol:connectionMade entry.")
+        self.factory.client_to_irnetbox_queue.get().addCallback(self.clientSideDataReceived)
+
+    def clientSideDataReceived(self, data):
+        log.msg("IRNetBoxProxyIRNetBoxSideProtocol:clientSideDataReceived entry.")
+        self.transport.write(data)
+        self.factory.client_to_irnetbox_queue.get().addCallback(self.clientSideDataReceived)
+
+    def dataReceived(self, data):
+        log.msg("IRNetBoxProxyIRNetBoxSideProtocol:dataReceived entry. data: %s" % (string_to_hex(data), ))
+        log.msg("self.current_data_received: %s" % (string_to_hex(self.current_data_received), ))
+
+        # ---------------------------------------------------------------------
+        #   §5.1: all messages from the irNetBox to host must be formatted as
+        #   <length><type><data>. 
+        #   -   If the data is currently malformed then stash it somewhere
+        #       for now; we expect subsequent data receives to complete this
+        #       data.
+        #   -   If there is enough data, both previously received and in the
+        #       current data, then get it and truncate our previously received
+        #       data buffer.
+        # ---------------------------------------------------------------------
+        self.current_data_received += data
+        while True:
+            if len(self.current_data_received) < 3:
+                return
+            data_len, = struct.unpack(">H", self.current_data_received[0:2])
+            if len(self.current_data_received) < 3 + data_len:
+                return        
+            data = self.current_data_received[:(3 + data_len)]
+            self.current_data_received = self.current_data_received[(3 + data_len):]
+            
+
+            # -----------------------------------------------------------------
+            #   §6: If this is a message indicating an asynchronous request has
+            #   now completed then ignore it.
+            # -----------------------------------------------------------------
+            response_type, response_data = struct.unpack(
+                ">B%ds" % data_len,
+                data[2:(3 + data_len)])
+            if response_type == MessageTypes.IR_ASYNC_COMPLETE:
+                log.msg("Ignoring IR_ASYNC_COMPLETE message.")
+                return        
+            # -----------------------------------------------------------------
+            
+            self.factory.irnetbox_to_client_queue.put(data)
+
+
+class IRNetBoxProxyIRNetBoxSideFactory(protocol.Factory):
+    protocol = IRNetBoxProxyIRNetBoxSideProtocol
+
+    def __init__(self, client_to_irnetbox_queue, irnetbox_to_client_queue):
+        log.msg("IRNetBoxProxyIRNetBoxSideFactory:__init__ entry.")
+        self.client_to_irnetbox_queue = client_to_irnetbox_queue
+        self.irnetbox_to_client_queue = irnetbox_to_client_queue
+
+    def startedConnecting(self, connector):
+        log.msg("IRNetBoxProxyIRNetBoxSideFactory:startedConnecting entry.")
+
+    def clientConnectionLost(self, connector, reason):
+        log.msg("IRNetBoxProxyIRNetBoxSideFactory:clientConnectionLost entry.")
+
+
+class IRNetBoxProxyClientSideProtocol(protocol.Protocol):
+
+    def __init__(self):
+        self.current_data_received = ""
+
+    def connectionMade(self):
+        self.connection_host = self.transport.getHost()
+        log.msg("IRNetBoxProxyClientSideProtocol:connectionMade entry. host: %s" % (self.connection_host, ))
+
+    def connectionLost(self, reason):
+        log.msg("IRNetBoxProxyClientSideProtocol:connectionLost entry.  host: %s" % (self.connection_host, ))        
+
+    def dataReceived(self, data):
+        """Data received from a client connected to the proxy."""
+
+        log.msg("IRNetBoxProxyClientSideProtocol:dataReceived entry. data: %s" % (string_to_hex(data), ))
+        log.msg("self.current_data_received: %s" % (string_to_hex(self.current_data_received), ))
+
+        # ---------------------------------------------------------------------
+        #   §5.1: all messages from the host to irNetBox must be formatted as
+        #   #<length><type><data>. (note the leading hash).
+        #   -   If the data is currently malformed then stash it somewhere
+        #       for now; we expect subsequent data receives to complete this
+        #       data.
+        #   -   If there is enough data, both previously received and in the
+        #       current data, then get it and truncate our previously received
+        #       data buffer.
+        # ---------------------------------------------------------------------
+        self.current_data_received += data
+        if len(self.current_data_received) < 4:
+            return
+        leading_hash, data_len = struct.unpack(">cH", self.current_data_received[0:3])
+        if len(self.current_data_received) < 4 + data_len:
+            return        
+        data = self.current_data_received[:(4 + data_len)]
+        self.current_data_received = self.current_data_received[(4 + data_len):]
+        # ---------------------------------------------------------------------
+
+        self.factory.irnetbox_lock.acquire() \
+                                  .addCallback(self._send_to_irnetbox, data)
+
+    def _send_to_irnetbox(self, deferred, data):
+        log.msg("IRNetBoxProxyClientSideProtocol:_send_to_irnetbox entry. data: %s" % (string_to_hex(data), ))
+
+        self.factory.client_to_irnetbox_queue.put(data)
+        self.factory.irnetbox_to_client_queue.get().addCallback(self.IRNetBoxDataReceived)
+
+    def IRNetBoxDataReceived(self, data):
+        log.msg("IRNetBoxProxyClientSideProtocol:IRNetBoxDataReceived entry. data: %s" % (string_to_hex(data), ))
+        self.transport.write(data)
+        reactor.callLater(IRNETBOX_CALL_INTERVAL, self.factory.irnetbox_lock.release)
+
+
+class IRNetBoxProxyClientSideFactory(protocol.Factory):
+    protocol = IRNetBoxProxyClientSideProtocol
+
+    def __init__(self, irnetbox_address, irnetbox_port=10001):
+        log.msg("IRNetBoxProxyClientSideFactory:__init__ entry.")
+        self.client_to_irnetbox_queue = defer.DeferredQueue()
+        self.irnetbox_to_client_queue = defer.DeferredQueue()
+        self.irnetbox_lock = defer.DeferredLock()
+
+        self.irnetbox_address = irnetbox_address
+        self.irnetbox_port = irnetbox_port
+        irnetbox_side_factory = IRNetBoxProxyIRNetBoxSideFactory(self.client_to_irnetbox_queue,
+                                                                 self.irnetbox_to_client_queue)
+        reactor.connectTCP(self.irnetbox_address, self.irnetbox_port, irnetbox_side_factory)
+
+
+def get_args():
+    parser = argparse.ArgumentParser(
+        description="Proxy requests from multiple cilents to an IRNetBox.")
+    parser.add_argument('-i', '--listen_ip_address', dest='ip_address',
+                        help='IP address to listen on. Default: all interfaces.', default="0.0.0.0")
+    parser.add_argument('-p', '--listen_port', type=int, dest='port', 
+                        help='Port to listen on. Default: 10001.', default=10001)
+    parser.add_argument('-r', '--irnetbox_address', dest='irnetbox_address',
+                        help='IRNetBox address', required=True)
+    return parser.parse_args()
+
+
+def main():
+    """Run IRNetBoxProxy and serialise all incoming TCP requests from clients
+    to the actual IRNetBox."""
+
+    args = get_args()
+    log.startLogging(sys.stdout)
+    reactor.listenTCP(args.port,
+                      IRNetBoxProxyClientSideFactory(args.irnetbox_address),
+                      interface=args.ip_address)
+    reactor.run()
+
+
+if __name__ == "__main__":
+    main()
