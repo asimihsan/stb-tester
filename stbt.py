@@ -592,15 +592,27 @@ class MatchTimeout(UITestFailure):
     * `expected`: Filename of the image that was being searched for.
     * `timeout_secs`: Number of seconds that the image was searched for.
     """
+    screenshot_identifier = 1
+
     def __init__(self, screenshot, expected, timeout_secs):
         super(MatchTimeout, self).__init__()
         self.screenshot = screenshot
         self.expected = expected
         self.timeout_secs = timeout_secs
+        self.save_screenshot()
 
     def __str__(self):
         return "Didn't find match for '%s' within %d seconds." % (
             self.expected, self.timeout_secs)
+
+    def save_screenshot(self):
+        output_filepath = "screenshot_matchtimeout_%08d.png" % \
+                          MatchTimeout.screenshot_identifier
+        debug("MatchTimeout saving screenshot to '%s' for expected '%s'..." %
+              (output_filepath, self.expected))
+        MatchTimeout.screenshot_identifier += 1
+        save_frame(self.screenshot, output_filepath)
+        debug("MatchTimeout finished saving screenshot.")
 
 
 class MotionTimeout(UITestFailure):
